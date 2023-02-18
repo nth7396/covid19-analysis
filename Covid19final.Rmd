@@ -1,0 +1,275 @@
+---
+title: "Covid-19 Data Analysis Report"
+output: html_document
+date: "2023-02-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Library Requirements
+Install these packages before running the codes. 
+
+```{r library,warning=FALSE,message = FALSE}
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(ggstatsplot)
+library(ggside)
+```
+
+## Data Import
+
+I will start by reading in the data from the four main Covid-19 csv files, and one extra csv file for US states' areas for the purpose of data modelling later on.
+
+```{r get_jhub_data,warning=FALSE,message = FALSE}
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+file_names <- c("time_series_covid19_confirmed_US.csv","time_series_covid19_deaths_US.csv",
+"time_series_covid19_confirmed_global.csv","time_series_covid19_deaths_global.csv")
+urls <- str_c(url_in,file_names)
+
+url_in2 <- "https://raw.githubusercontent.com/jakevdp/data-USstates/b9c5dfaf9530ac3fcab6bfee86aa2f3f6d4e8bea/"
+file_names2 <- "state-areas.csv"
+urls2 <- str_c(url_in2,file_names2)
+```
+Let's read in the data and see what we have.
+
+```{r import_data, warning=FALSE,message = FALSE}
+global_cases <- read_csv(urls[3])
+global_deaths <- read_csv(urls[4])
+US_cases <- read_csv(urls[1])
+US_deaths <- read_csv(urls[2])
+US_state_area <- read_csv(urls2[1])
+```
+After looking at global_cases and global deaths, I would like to tidy those datasets and put each variable (date, cases, deaths) in their own column. 
+Also, I don't need Lat and Long for the analysis I am planning, so I will delete those and rename Region and State to be more R friendly.
+
+```{r tidy_global_data,echo=TRUE,warning=FALSE,message = FALSE}
+global_cases <- global_cases %>%
+  pivot_longer(cols=-c('Province/State','Country/Region',Lat,Long),
+               names_to="date",values_to="cases") %>%
+  select(-c(Lat,Long))
+
+global_deaths <- global_deaths %>%
+  pivot_longer(cols=-c('Province/State','Country/Region',Lat,Long),
+               names_to="date",values_to="deaths") %>%
+  select(-c(Lat,Long))
+
+global <- global_cases %>%
+  full_join(global_deaths) %>%
+  rename(Country_Region='Country/Region',Province_State='Province/State') %>%
+  mutate(date=mdy(date))
+
+global <- global %>% filter(cases > 0)
+
+US_cases <- US_cases %>%
+  pivot_longer(cols=-(UID:Combined_Key),
+               names_to="date",
+               values_to="cases") %>%
+  select(Admin2:cases) %>%
+  mutate(date=mdy(date)) %>%
+  select(-c(Lat, Long_))
+
+US_deaths <- US_deaths %>%
+  pivot_longer(cols=-(UID:Population),
+               names_to="date",
+               values_to="deaths") %>%
+  select(Admin2:deaths) %>%
+  mutate(date=mdy(date)) %>%
+  select(-c(Lat, Long_))
+
+US <- US_cases %>%
+  full_join(US_deaths)
+
+global <- global %>%
+  unite("Combined_Key",
+        c(Province_State, Country_Region),
+        sep=", ",
+        na.rm = TRUE,
+        remove = FALSE)
+#Look up for population information on John Hopkins
+
+uid_lookup_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+
+#Then join the population data with the Global data-set
+uid <- read_csv(uid_lookup_url) %>%
+  select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2))
+global <- global %>%
+  left_join(uid, by = c("Province_State", "Country_Region")) %>%
+  select(-c(UID, FIPS)) %>%
+  select(Province_State, Country_Region, date, cases, deaths, Population, Combined_Key)
+
+#Prepare the data by US states
+US_by_state <- US %>%
+  group_by(Province_State, Country_Region, date) %>%
+  summarize(cases=sum(cases), deaths=sum(deaths),
+            Population=sum(Population)) %>%
+  mutate(deaths_per_mill=deaths*1000000/Population) %>%
+  select(Province_State, Country_Region, date,
+         cases, deaths, deaths_per_mill, Population) %>%
+  ungroup()
+
+#Prepare the data for US totals
+US_totals <- US_by_state %>%
+  group_by(Country_Region, date) %>% 
+  summarize(cases = sum(cases), deaths = sum (deaths), Population = sum(Population)) %>%
+  mutate(deaths_per_mill = deaths *1000000 / Population) %>%
+  select(Country_Region, date, cases, deaths, deaths_per_mill, Population) %>%
+  ungroup()
+
+#Prepare data for new cases and new deaths
+US_by_state <- US_by_state %>% 
+  mutate(new_cases = cases - lag(cases),
+         new_deaths = deaths - lag(deaths))
+US_totals <- US_totals %>%
+  mutate(new_cases = cases - lag (cases),
+         new_deaths = deaths - lag (deaths))
+tail(US_totals %>% select(new_cases, new_deaths, everything()))
+
+#Prepare data for top states impacted
+US_state_totals <- US_by_state %>%
+  group_by (Province_State) %>%
+  summarize (deaths = max(deaths), cases = max(cases), population = max (Population),
+             cases_per_thou = 1000 * cases / population, 
+             deaths_per_thou = 1000 * deaths / population) %>%
+  filter (cases > 0, population > 0)
+
+min_states <- US_state_totals %>%
+  slice_min(deaths_per_thou, n=13)
+max_states <- US_state_totals %>%
+  slice_max(deaths_per_thou, n=10)
+
+#Prepare for data modelling to explore the relationship between population density and fatality rate
+
+colnames(US_state_area)[1] ="Province_State"
+US_state_totals2 <- inner_join(US_state_totals, US_state_area, 
+           by = "Province_State")
+US_state_totals3 <- US_state_totals2 %>%
+  group_by (Province_State) %>%
+  summarize(deaths_per_thou,pop_dens=population/`area (sq. mi)`,
+            log_pop_dens=log(population/`area (sq. mi)`)) #Log transformation is required for this regression
+
+## Data modelling
+mod2 <- lm(deaths_per_thou ~ log_pop_dens, data = US_state_totals3)
+summary(mod2)
+
+min_states_dens <- US_state_totals3 %>%
+  slice_min(log_pop_dens, n=10)
+max_states_dens <- US_state_totals3 %>%
+  slice_max(log_pop_dens, n=10)
+
+x_grid2 <- seq(0,10)
+new_df2 <- tibble(cases_per_thou = x_grid2)
+US_state_totals3 %>% mutate(pred=predict(mod2))
+US_tot_w_pred2 <- US_state_totals3 %>% mutate(pred = predict(mod2))
+```
+
+## Data Summary
+Below is an overview of the dataset.
+```{r sum, echo=TRUE, warning=FALSE,message = FALSE}
+summary(US_totals)
+```
+
+
+## Data Visualization
+
+Use the prepared data above to make some visualizations. First, we look at the general trends of new cases and deaths in all of US.
+
+#### Visualization 1: Numbers of new cases and new deaths in the US
+```{r visualization1, echo=TRUE, warning=FALSE,message = FALSE}
+
+US_totals %>%
+  ggplot (aes(x = date, y = new_cases)) +
+  geom_smooth(aes (color = "new_cases")) +
+  geom_smooth(aes (y = new_deaths, color = "new_deaths")) +
+  scale_y_log10() +
+  theme (legend.position="bottom", axis.text.x = element_text(angle = 90)) +
+  labs (title = "COVID19 in US", y= NULL)
+```
+
+
+Secondly, we look at the the states with lowest and highest Covid-19 fatality rates.
+
+#### Visualization 2: States with the lowest COVID-19 deaths per thousands of population
+```{r visualization2, echo=TRUE, warning=FALSE,message = FALSE}
+ggplot(min_states[4:13,], aes(x=reorder(Province_State, -deaths_per_thou), y=deaths_per_thou)) + 
+  geom_bar(stat="identity", width=.5, fill="blue") + coord_cartesian(ylim = c(1, 3)) +
+  labs(title="States with lowest COVID-19 deaths per thousands of population", 
+       caption="source: John Hopkins") + xlab("State") + ylab("Deaths per Thousand") + scale_x_discrete(guide = guide_axis(n.dodge = 2))
+  theme(axis.text.x = element_text(angle=65, vjust=0.6))
+```
+
+#### Visualization 3: States with the highest COVID-19 deaths per thousands of population
+```{r visualization3, echo=TRUE, warning=FALSE,message = FALSE}
+ggplot(max_states, aes(x=reorder(Province_State, -deaths_per_thou), y=deaths_per_thou)) + 
+  geom_bar(stat="identity", width=.5, fill="tomato3") + coord_cartesian(ylim = c(3.5, 5.5)) +
+  labs(title="States with highest COVID-19 deaths per thousands of population", 
+       caption="source: John Hopkins") + xlab("State") + ylab("Deaths per Thousand") + scale_x_discrete(guide = guide_axis(n.dodge = 2))
+  theme(axis.text.x = element_text(angle=65, vjust=0.6))
+```
+
+
+Thirdly, we look at the specific trends in Hawaii where there is the lowest rate of fatality and in Arizona where there is the highest rate of fatality.
+
+#### Visualization 4: Numbers of new cases and new deaths in the state of Hawaii
+```{r visualization4, echo=TRUE, warning=FALSE,message = FALSE}
+state <- "Hawaii"
+US_by_state %>%
+  filter (Province_State==state) %>%
+  filter (cases > 0) %>%
+  ggplot (aes(x = date, y = new_cases)) +
+  geom_smooth(aes (color = "new_cases")) +
+  geom_smooth(aes (y = deaths, color = "new_deaths")) +
+  scale_y_log10() +
+  theme (legend.position="bottom", axis.text.x = element_text(angle = 90)) +
+  labs(title= str_c("COVID19 in ", state), y= NULL)
+```
+
+#### Visualization 5: Numbers of new cases and new deaths in the state of Arizona
+```{r visualization5, echo=TRUE, warning=FALSE,message = FALSE}
+state <- "Arizona"
+US_by_state %>%
+  filter (Province_State==state) %>%
+  filter (cases > 0) %>%
+  ggplot (aes(x = date, y = new_cases)) +
+  geom_smooth(aes (color = "new_cases")) +
+  geom_smooth(aes (y = deaths, color = "new_deaths")) +
+  scale_y_log10() +
+  theme (legend.position="bottom", axis.text.x = element_text(angle = 90)) +
+  labs(title= str_c("COVID19 in ", state), y= NULL)
+```
+
+## Data Modelling and Analysis
+
+### Question of Interest
+
+
+Looking at the visualizations of states with the lowest and highest fatality rates, I can't help but wonder what are the factors behind such discrepancies. What makes a state more or less susceptible to a higher death rate for Covid-19? One of the possible explanation could be population density, as it is commonly believed that urban centers with high concentration of people and movements might lead to higher transmission rates and ultimately higher fatality rates. My question of interest will explore the relationship (if any) between a state's population density and its Covid-19 fatality rate.
+
+#### Data model 1: Population Density vs. Fatality Rate: Reality and Prediction
+```{r model1, echo=TRUE,warning=FALSE,message = FALSE}
+US_tot_w_pred2 %>% 
+  ggplot() +
+  geom_point(aes(x=log_pop_dens, y=deaths_per_thou), color = "blue") +
+  geom_point(aes(x=log_pop_dens, y=pred), color = "red")
+```
+
+
+Ones can observe that the prediction is poor in its ability to correctly situate the actual data points. The graph shows no significant relationship between population density and fatality rate.
+
+Below is another visualization of the relationship between population density and fatality rate. Here we have the Pearson correlation coefficient is approximately zero. Hence, the conclusion is that there is no significant relationship between a state's population density and its fatality rate. 
+
+#### Data Model 2
+```{r model2, echo=TRUE,warning=FALSE,message = FALSE}
+ggscatterstats(
+  data = US_state_totals3,
+  x = log_pop_dens, y = deaths_per_thou,
+  bf.message = FALSE)
+```
+
+
+### Conclusion
+
+In conclusion, a state's population density does not seem to explain its Covid-19 fatality rate. However, this conclusion is not final as there might be selection bias in this analysis. For instance, ones might use a different parameter instead of population density, such as the amount of people living in urban areas vs. rural areas, or the amount of people living under 30 minute away from a downtown central core, as this might better reflect the question of interest. Hence, further research must be carried out to answer questions regarding the differences in US states' Covid-19 fatality.  
